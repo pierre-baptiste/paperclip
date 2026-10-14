@@ -7273,6 +7273,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: expect.objectContaining({ issueId, wakeCommentIds: [handoff!.id] }) });
   });
 
+  it("resumes an acknowledged handoff on a fresh service after cleanup has already settled", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      runtimeMode: "legacy", adapterType: "opencode_local", agentStatus: "idle", runStatus: "cancelled",
+      runErrorCode: "issue_reassigned",
+    });
+    const newAgentId = randomUUID();
+    await db.insert(agents).values({ id: newAgentId, companyId, name: "Researcher", role: "engineer",
+      status: "idle", adapterType: "opencode_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(), resultJson: {
+      reassignmentStopConfirmed: true, issueMutationStopId: randomUUID(),
+      conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "acknowledged" },
+    } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ assigneeAgentId: newAgentId, executionRunId: null, checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId,
+      createdByRunId: runId, body: "Continue the existing research task" }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: newAgentId,
+      source: "assignment", reason: "issue_assigned", triggerDetail: "system", status: "deferred_issue_execution",
+      requestedByActorType: "agent", requestedByActorId: agentId, updatedAt: new Date(Date.now() - 60_000),
+      payload: { issueId, commentId: comment!.id, interruptedRunId: runId, mutation: "update",
+        executionWait: { reason: "execution_recovery", recoveryActionId: null },
+        _paperclipWakeContext: { issueId, interruptedRunId: runId, wakeReason: "issue_assigned",
+          wakeCommentIds: [comment!.id] } },
+    }).returning();
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+    mockAdapterExecute.mockImplementation(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, summary: "Research completed", provider: "test", model: "test-model" };
+    });
+    const freshService = heartbeatService(db);
+    await Promise.all([freshService.resumeQueuedRuns(), heartbeatService(db).resumeQueuedRuns()]);
+    const [updated] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+    expect(updated).toMatchObject({ status: expect.not.stringMatching(/^deferred_issue_execution$/), runId: expect.any(String) });
+    await freshService.drainActiveRunExecutions();
+    await freshService.resumeQueuedRuns();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wake!.id))).toHaveLength(1);
+  });
+
   it("retries durable queue interruption after a promotion failure on a fresh service", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       runtimeMode: "legacy", adapterType: "codex_local", agentStatus: "idle", runStatus: "cancelled",
